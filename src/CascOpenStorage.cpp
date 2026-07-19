@@ -368,6 +368,7 @@ static size_t GetEstimatedNumberOfFiles(TCascStorage * hs)
 static DWORD InitCKeyArray(TCascStorage * hs)
 {
     size_t nNumberOfFiles = GetEstimatedNumberOfFiles(hs);
+    size_t EKeyLength = (hs->BuildFileType == CascBuildConfig) ? MD5_HASH_SIZE : CASC_EKEY_SIZE;
     DWORD dwErrCode;
 
     //
@@ -384,9 +385,9 @@ static DWORD InitCKeyArray(TCascStorage * hs)
     if(dwErrCode != ERROR_SUCCESS)
         return dwErrCode;
 
-    // Create the map CKey -> CASC_CKEY_ENTRY. Note that TVFS root references files
-    // using 9-byte EKey, so cut the search EKey length to 9 bytes
-    dwErrCode = hs->EKeyMap.Create(nNumberOfFiles, CASC_EKEY_SIZE, FIELD_OFFSET(CASC_CKEY_ENTRY, EKey));
+    // Create the map EKey -> CASC_CKEY_ENTRY. Note that most TVFS roots reference files
+    // using 9-byte EKey, while static storages use the full 16-byte EKey
+    dwErrCode = hs->EKeyMap.Create(nNumberOfFiles, EKeyLength, FIELD_OFFSET(CASC_CKEY_ENTRY, EKey));
     if(dwErrCode != ERROR_SUCCESS)
         return dwErrCode;
 
@@ -1191,10 +1192,21 @@ static DWORD LoadCascStorage(TCascStorage * hs, PCASC_OPEN_STORAGE_ARGS pArgs, L
 
     // Construct the root path from the name of the build file
     CASC_PATH<TCHAR> RootPath(szMainFile, NULL);
-    hs->szRootPath = RootPath.New(true);
+    if(BuildFileType == CascBuildConfig)
+    {
+        hs->szDataPath = RootPath.New(true);
+        hs->szRootPath = RootPath.New(true);
+        hs->EKeyLength = MD5_HASH_SIZE;
+        hs->FileOffsetBits = 40;
+    }
+    else
+    {
+        hs->szRootPath = RootPath.New(true);
+    }
 
     // If either of the root path or build file is known, it's an error
-    if(hs->szRootPath == NULL || hs->szMainFile == NULL)
+    if(hs->szRootPath == NULL || hs->szMainFile == NULL ||
+       (BuildFileType == CascBuildConfig && hs->szDataPath == NULL))
     {
         dwErrCode = ERROR_NOT_ENOUGH_MEMORY;
     }
@@ -1202,18 +1214,21 @@ static DWORD LoadCascStorage(TCascStorage * hs, PCASC_OPEN_STORAGE_ARGS pArgs, L
     // Initialize variables for local CASC storages
     if(dwErrCode == ERROR_SUCCESS)
     {
-        // For local (game) storages, we need the data and indices subdirectory
-        if(hs->dwFeatures & CASC_FEATURE_DATA_ARCHIVES)
+        if(BuildFileType != CascBuildConfig)
         {
-            if(CheckArchiveFilesDirectories(hs) != ERROR_SUCCESS)
-                hs->dwFeatures &= ~CASC_FEATURE_DATA_ARCHIVES;
-        }
+            // For local (game) storages, we need the data and indices subdirectory
+            if(hs->dwFeatures & CASC_FEATURE_DATA_ARCHIVES)
+            {
+                if(CheckArchiveFilesDirectories(hs) != ERROR_SUCCESS)
+                    hs->dwFeatures &= ~CASC_FEATURE_DATA_ARCHIVES;
+            }
 
-        // For data files storage, we need that folder
-        if(hs->dwFeatures & CASC_FEATURE_DATA_FILES)
-        {
-            if(CheckDataFilesDirectory(hs) != ERROR_SUCCESS)
-                hs->dwFeatures &= ~CASC_FEATURE_DATA_FILES;
+            // For data files storage, we need that folder
+            if(hs->dwFeatures & CASC_FEATURE_DATA_FILES)
+            {
+                if(CheckDataFilesDirectory(hs) != ERROR_SUCCESS)
+                    hs->dwFeatures &= ~CASC_FEATURE_DATA_FILES;
+            }
         }
 
         // Enable caching of the sockets. This will add references
@@ -1234,7 +1249,7 @@ static DWORD LoadCascStorage(TCascStorage * hs, PCASC_OPEN_STORAGE_ARGS pArgs, L
     }
 
     // Proceed with loading the CDN build file
-    if(dwErrCode == ERROR_SUCCESS)
+    if(dwErrCode == ERROR_SUCCESS && BuildFileType != CascBuildConfig)
     {
         dwErrCode = LoadCdnBuildFile(hs);
     }
@@ -1258,22 +1273,34 @@ static DWORD LoadCascStorage(TCascStorage * hs, PCASC_OPEN_STORAGE_ARGS pArgs, L
         dwErrCode = InitCKeyArray(hs);
     }
 
-    // Pre-load the local index files
-    if(dwErrCode == ERROR_SUCCESS)
+    // Static storages have no ENCODING manifest, so insert BUILD entries directly
+    if(BuildFileType != CascBuildConfig)
     {
-        dwErrCode = LoadIndexFiles(hs);
-    }
+        // Pre-load the local index files
+        if(dwErrCode == ERROR_SUCCESS)
+        {
+            dwErrCode = LoadIndexFiles(hs);
+        }
 
-    // Load the ENCODING manifest
-    if(dwErrCode == ERROR_SUCCESS)
-    {
-        dwErrCode = LoadEncodingManifest(hs);
-    }
+        // Load the ENCODING manifest
+        if(dwErrCode == ERROR_SUCCESS)
+        {
+            dwErrCode = LoadEncodingManifest(hs);
+        }
 
-    // We need to load the DOWNLOAD manifest
-    if(dwErrCode == ERROR_SUCCESS)
+        // Load the DOWNLOAD manifest. We're tolerant if the manifest is not present in the storage
+        if(dwErrCode == ERROR_SUCCESS)
+        {
+            dwErrCode = LoadDownloadManifest(hs);
+            dwErrCode = (dwErrCode == ERROR_FILE_NOT_FOUND) ? ERROR_SUCCESS : dwErrCode;
+        }
+    }
+    else
     {
-        dwErrCode = LoadDownloadManifest(hs);
+        if(dwErrCode == ERROR_SUCCESS)
+        {
+            dwErrCode = CopyBuildFileItemsToCKeyArray(hs);
+        }
     }
 
     // Load the build manifest ("ROOT" file)
@@ -1290,10 +1317,14 @@ static DWORD LoadCascStorage(TCascStorage * hs, PCASC_OPEN_STORAGE_ARGS pArgs, L
 
         // If we fail to load the ROOT file, we take the file names from the INSTALL manifest
         // Beware on low memory condition - in that case, we cannot guarantee a consistent state of the root file
-        if(dwErrCode != ERROR_SUCCESS && dwErrCode != ERROR_NOT_ENOUGH_MEMORY)
+        if(dwErrCode != ERROR_SUCCESS && dwErrCode != ERROR_NOT_ENOUGH_MEMORY && BuildFileType != CascBuildConfig)
         {
             dwErrCode = LoadInstallManifest(hs);
         }
+
+        // All entries in a static storage describe local data files
+        if(dwErrCode == ERROR_SUCCESS && BuildFileType == CascBuildConfig)
+            hs->LocalFiles = hs->CKeyArray.ItemCount();
     }
 
     // Insert entries for files with well-known names. Their CKeys are in the BUILD file
